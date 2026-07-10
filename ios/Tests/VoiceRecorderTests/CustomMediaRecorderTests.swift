@@ -28,6 +28,10 @@ final class CustomMediaRecorderTests: XCTestCase {
             self.category = category
         }
 
+        func setCategory(_ category: AVAudioSession.Category, mode: AVAudioSession.Mode, options: AVAudioSession.CategoryOptions) throws {
+            try setCategory(category)
+        }
+
         func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
             setActiveCalls.append(active)
             setActiveOptionsCalls.append(options)
@@ -38,6 +42,7 @@ final class CustomMediaRecorderTests: XCTestCase {
     }
 
     private final class FakeAudioRecorder: AudioRecorderProtocol {
+        var isRecording = true
         var isMeteringEnabled = false
         var recordCallCount = 0
         var stopCallCount = 0

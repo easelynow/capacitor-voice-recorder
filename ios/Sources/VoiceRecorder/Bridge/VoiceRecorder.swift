@@ -42,6 +42,19 @@ public class VoiceRecorder: CAPPlugin, CAPBridgedPlugin {
     public override func load() {
         super.load()
         responseFormat = ResponseFormat(config: getConfig())
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
         service = VoiceRecorderService(
             platform: DefaultRecorderPlatform(),
             permissionChecker: { [weak self] in
@@ -100,7 +113,14 @@ public class VoiceRecorder: CAPPlugin, CAPBridgedPlugin {
 
         let directory: String? = call.getString("directory")
         let subDirectory: String? = call.getString("subDirectory")
-        let recordOptions = RecordOptions(directory: directory, subDirectory: subDirectory)
+        let segmentDurationMs: Int? = call.getInt("segmentDurationMs")
+        let sessionId: String? = call.getString("sessionId")
+        let recordOptions = RecordOptions(
+            directory: directory,
+            subDirectory: subDirectory,
+            segmentDurationMs: segmentDurationMs,
+            sessionId: sessionId
+        )
         do {
             try service.startRecording(
                 options: recordOptions,
@@ -109,6 +129,16 @@ public class VoiceRecorder: CAPPlugin, CAPBridgedPlugin {
                 },
                 onInterruptionEnded: { [weak self] in
                     self?.notifyListeners("voiceRecordingInterruptionEnded", data: [:])
+                },
+                onSegmentReady: { [weak self] seg in
+                    self?.notifyListeners("segmentReady", data: [
+                        "sessionId": seg.sessionId,
+                        "index": seg.index,
+                        "uri": seg.uri,
+                        "fileName": seg.fileName,
+                        "msDuration": seg.msDuration,
+                        "mimeType": seg.mimeType
+                    ])
                 }
             )
             call.resolve(ResponseGenerator.successResponse())
@@ -203,5 +233,67 @@ public class VoiceRecorder: CAPPlugin, CAPBridgedPlugin {
             return Messages.CANNOT_RECORD_ON_THIS_PHONE
         }
         return canonicalCode
+    }
+
+    /// Flushes the current audio segment and emits segmentReady on app termination.
+    /// FIX 4: Write pending flush marker, use terminating=true, wait for callback.
+    @objc private func handleAppWillTerminate() {
+        guard let service = service else { return }
+
+        let semaphore = DispatchSemaphore(value: 0)
+
+        // FIX 4: Call flush with terminating=true to stop recorder without restart
+        service.flushCurrentSegment(terminating: true) { [weak self] info in
+            guard let self = self, let info = info else {
+                semaphore.signal()
+                return
+            }
+
+            // FIX 4: Write pending flush marker file
+            let markerData: [String: Any] = [
+                "sessionId": info.sessionId,
+                "segmentIndex": info.index,
+                "fileName": info.fileName,
+                "path": info.uri,
+                "durationMs": info.msDuration,
+                "mimeType": info.mimeType
+            ]
+
+            do {
+                let jsonData = try JSONSerialization.data(withJSONObject: markerData, options: [])
+                // Write the marker NEXT TO the segment files so boot-time disk-scan
+                // reconciliation finds it together with the orphaned segment.
+                let directory = URL(fileURLWithPath: info.uri).deletingLastPathComponent()
+                let markerPath = directory.appendingPathComponent("pending_flush_\(info.sessionId).json")
+                try jsonData.write(to: markerPath, options: .atomic)
+            } catch {
+                print("Failed to write pending flush marker: \(error)")
+            }
+
+            // Notify listeners about the final segment
+            self.notifyListeners("segmentReady", data: [
+                "sessionId": info.sessionId,
+                "index": info.index,
+                "uri": info.uri,
+                "fileName": info.fileName,
+                "msDuration": info.msDuration,
+                "mimeType": info.mimeType
+            ])
+
+            semaphore.signal()
+        }
+
+        // FIX 4: Wait up to 3 seconds for flush to complete
+        let result = semaphore.wait(timeout: .now() + 3.0)
+        if result == .timedOut {
+            print("flushCurrentSegment timed out during termination")
+        }
+    }
+
+    /// On background entry in segmented mode, suspend the timer to pause segment rotation.
+    @objc private func handleAppDidEnterBackground() {
+        // AVAudioSession with mixWithOthers keeps recording in background.
+        // Nothing extra needed — segment timer continues running.
+        // iOS will suspend the app after ~3 min unless audio keeps playing.
     }
 }

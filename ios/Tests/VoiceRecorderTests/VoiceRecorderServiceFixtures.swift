@@ -26,6 +26,7 @@ final class VoiceRecorderServiceFixtures {
         var options: RecordOptions?
         var onInterruptionBegan: (() -> Void)?
         var onInterruptionEnded: (() -> Void)?
+        var onSegmentReady: ((SegmentInfo) -> Void)?
         var outputFile: URL = URL(fileURLWithPath: "/tmp/recording.m4a")
         var status: CurrentRecordingStatus = .NONE
         var stopSuccess = true
@@ -71,6 +72,10 @@ final class VoiceRecorderServiceFixtures {
 
         func getOutputFile() -> URL {
             return outputFile
+        }
+
+        func flushCurrentSegment(terminating: Bool, completion: @escaping (SegmentInfo?) -> Void) {
+            completion(nil)
         }
     }
 
