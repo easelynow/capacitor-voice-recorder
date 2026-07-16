@@ -7,17 +7,16 @@ import app.independo.capacitorvoicerecorder.core.CurrentRecordingStatus;
 import app.independo.capacitorvoicerecorder.core.ErrorCodes;
 import app.independo.capacitorvoicerecorder.core.RecordData;
 import app.independo.capacitorvoicerecorder.core.RecordOptions;
+import app.independo.capacitorvoicerecorder.core.SegmentInfo;
 import app.independo.capacitorvoicerecorder.platform.NotSupportedOsVersion;
-import java.io.File;
 
-/** Service layer that orchestrates recording operations. */
+import java.io.File;
+import java.util.function.Consumer;
+
 public class VoiceRecorderService {
 
-    /** Platform adapter that owns file and recorder creation. */
     private final RecorderPlatform platform;
-    /** Permission checker injected from the bridge layer. */
     private final PermissionChecker permissionChecker;
-    /** Current recorder instance for an active session. */
     private RecorderAdapter recorder;
 
     public VoiceRecorderService(RecorderPlatform platform, PermissionChecker permissionChecker) {
@@ -25,21 +24,27 @@ public class VoiceRecorderService {
         this.permissionChecker = permissionChecker;
     }
 
-    /** Returns whether the device can record audio. */
     public boolean canDeviceVoiceRecord() {
         return platform.canDeviceVoiceRecord();
     }
 
-    /** Returns whether the app has microphone permission. */
     public boolean hasAudioRecordingPermission() {
         return permissionChecker.hasAudioPermission();
     }
 
-    /** Starts a recording session or throws a service exception. */
     public void startRecording(
         RecordOptions options,
         Runnable onInterruptionBegan,
         Runnable onInterruptionEnded
+    ) throws VoiceRecorderServiceException {
+        startRecording(options, onInterruptionBegan, onInterruptionEnded, segmentInfo -> {});
+    }
+
+    public void startRecording(
+        RecordOptions options,
+        Runnable onInterruptionBegan,
+        Runnable onInterruptionEnded,
+        Consumer<SegmentInfo> onSegmentReady
     ) throws VoiceRecorderServiceException {
         if (!platform.canDeviceVoiceRecord()) {
             throw new VoiceRecorderServiceException(ErrorCodes.DEVICE_CANNOT_VOICE_RECORD);
@@ -61,6 +66,7 @@ public class VoiceRecorderService {
             recorder = platform.createRecorder(options);
             recorder.setOnInterruptionBegan(onInterruptionBegan);
             recorder.setOnInterruptionEnded(onInterruptionEnded);
+            recorder.setOnSegmentReady(onSegmentReady);
             recorder.startRecording();
         } catch (Exception exp) {
             recorder = null;
@@ -68,7 +74,6 @@ public class VoiceRecorderService {
         }
     }
 
-    /** Stops the active recording session and returns the payload. */
     public RecordData stopRecording() throws VoiceRecorderServiceException {
         if (recorder == null) {
             throw new VoiceRecorderServiceException(ErrorCodes.RECORDING_HAS_NOT_STARTED);
@@ -92,7 +97,24 @@ public class VoiceRecorderService {
             }
 
             int duration = platform.getDurationMs(recordedFile);
-            RecordData recordData = new RecordData(recordDataBase64, duration, "audio/aac", "aac", uri);
+
+            String mimeType;
+            String fileExtension;
+            String fileName = recordedFile.getName();
+            int dotIndex = fileName.lastIndexOf('.');
+            if (dotIndex > 0) {
+                fileExtension = fileName.substring(dotIndex + 1);
+                mimeType = switch (fileExtension) {
+                    case "m4a", "mp4" -> "audio/mp4";
+                    case "aac" -> "audio/aac";
+                    default -> "audio/aac";
+                };
+            } else {
+                mimeType = "audio/aac";
+                fileExtension = "aac";
+            }
+
+            RecordData recordData = new RecordData(recordDataBase64, duration, mimeType, fileExtension, uri);
             if ((recordDataBase64 == null && uri == null) || recordData.getMsDuration() < 0) {
                 throw new VoiceRecorderServiceException(ErrorCodes.EMPTY_RECORDING);
             }
@@ -110,7 +132,6 @@ public class VoiceRecorderService {
         }
     }
 
-    /** Pauses the active recording session. */
     public boolean pauseRecording() throws VoiceRecorderServiceException {
         if (recorder == null) {
             throw new VoiceRecorderServiceException(ErrorCodes.RECORDING_HAS_NOT_STARTED);
@@ -122,7 +143,6 @@ public class VoiceRecorderService {
         }
     }
 
-    /** Resumes a paused recording session. */
     public boolean resumeRecording() throws VoiceRecorderServiceException {
         if (recorder == null) {
             throw new VoiceRecorderServiceException(ErrorCodes.RECORDING_HAS_NOT_STARTED);
@@ -134,7 +154,6 @@ public class VoiceRecorderService {
         }
     }
 
-    /** Returns the current recording status. */
     public CurrentRecordingStatus getCurrentStatus() {
         if (recorder == null) {
             return CurrentRecordingStatus.NONE;
@@ -142,11 +161,20 @@ public class VoiceRecorderService {
         return recorder.getCurrentStatus();
     }
 
-    /** Returns the current input amplitude normalized to [0, 1]. */
     public double getCurrentAmplitude() {
         if (recorder == null) {
             return 0;
         }
         return recorder.getCurrentAmplitude();
+    }
+
+    public void flushCurrentSegment(boolean terminating, Consumer<SegmentInfo> completion) {
+        if (recorder == null) {
+            if (completion != null) {
+                completion.accept(null);
+            }
+            return;
+        }
+        recorder.flushCurrentSegment(terminating, completion);
     }
 }

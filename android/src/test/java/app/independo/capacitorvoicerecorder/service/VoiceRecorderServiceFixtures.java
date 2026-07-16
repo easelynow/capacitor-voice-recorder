@@ -5,8 +5,11 @@ import app.independo.capacitorvoicerecorder.adapters.RecorderAdapter;
 import app.independo.capacitorvoicerecorder.adapters.RecorderPlatform;
 import app.independo.capacitorvoicerecorder.core.CurrentRecordingStatus;
 import app.independo.capacitorvoicerecorder.core.RecordOptions;
+import app.independo.capacitorvoicerecorder.core.SegmentInfo;
 import app.independo.capacitorvoicerecorder.platform.NotSupportedOsVersion;
+
 import java.io.File;
+import java.util.function.Consumer;
 
 final class VoiceRecorderServiceFixtures {
 
@@ -149,6 +152,17 @@ final class VoiceRecorderServiceFixtures {
         public boolean deleteOutputFile() {
             deleteCalled = true;
             return true;
+        }
+
+        @Override
+        public void setOnSegmentReady(Consumer<SegmentInfo> callback) {
+        }
+
+        @Override
+        public void flushCurrentSegment(boolean terminating, Consumer<SegmentInfo> completion) {
+            if (completion != null) {
+                completion.accept(null);
+            }
         }
     }
 }
