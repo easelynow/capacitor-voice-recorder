@@ -1,29 +1,44 @@
 <p align="center">
   <img src="https://user-images.githubusercontent.com/236501/85893648-1c92e880-b7a8-11ea-926d-95355b8175c7.png" width="128" height="128" alt="CapacitorJS Logo" />
 </p>
-<h3 align="center">Capacitor Voice Recorder</h3>
-<p align="center"><strong><code>@independo/capacitor-voice-recorder</code></strong></p>
-<p align="center">Capacitor plugin for audio recording</p>
+<h3 align="center">Capacitor Audit Recorder</h3>
+<p align="center"><strong><code>@easelynow/capacitor-audit-recorder</code></strong></p>
+<p align="center">Capacitor plugin for continuous background audit voice recording (segmented), plus general-purpose audio recording</p>
 
 <p align="center">
   <img src="https://img.shields.io/maintenance/yes/2026" alt="Maintenance Badge: until 2026" />
-  <a href="https://www.npmjs.com/package/@independo/capacitor-voice-recorder"><img src="https://img.shields.io/npm/l/@independo/capacitor-voice-recorder" alt="License Badge: MIT" /></a>
+  <a href="https://www.npmjs.com/package/@easelynow/capacitor-audit-recorder"><img src="https://img.shields.io/npm/l/@easelynow/capacitor-audit-recorder" alt="License Badge: MIT" /></a>
 <br>
-  <a href="https://www.npmjs.com/package/@independo/capacitor-voice-recorder"><img src="https://img.shields.io/npm/dw/@independo/capacitor-voice-recorder" alt="" role="presentation" /></a>
-  <a href="https://www.npmjs.com/package/@independo/capacitor-voice-recorder"><img src="https://img.shields.io/npm/v/@independo/capacitor-voice-recorder" alt="" role="presentation" /></a>
-  <a href="https://codecov.io/gh/independo-gmbh/capacitor-voice-recorder/branch/master"><img src="https://codecov.io/gh/independo-gmbh/capacitor-voice-recorder/branch/master/graph/badge.svg" alt="Coverage Badge: master" /></a>
+  <a href="https://www.npmjs.com/package/@easelynow/capacitor-audit-recorder"><img src="https://img.shields.io/npm/dw/@easelynow/capacitor-audit-recorder" alt="" role="presentation" /></a>
+  <a href="https://www.npmjs.com/package/@easelynow/capacitor-audit-recorder"><img src="https://img.shields.io/npm/v/@easelynow/capacitor-audit-recorder" alt="" role="presentation" /></a>
+  <a href="https://codecov.io/gh/easelynow/capacitor-voice-recorder/branch/dev"><img src="https://codecov.io/gh/easelynow/capacitor-voice-recorder/branch/dev/graph/badge.svg" alt="Coverage Badge: dev" /></a>
 </p>
 
 ## Overview
 
-The `@independo/capacitor-voice-recorder` plugin allows you to record audio on Android, iOS, and Web platforms.
+The `@easelynow/capacitor-audit-recorder` plugin records audio on Android, iOS, and Web. It supports two modes:
+
+- **General-purpose recording** — start/stop/pause/resume a single recording, returned as base64 or a filesystem
+  URI. This is the original `capacitor-voice-recorder` feature set (permissions, interruption handling, amplitude
+  metering).
+- **Continuous segmented recording** (`RecordingOptions.segmentDurationMs`) — purpose-built for long (30-90 min)
+  background audit recordings. The recorder auto-rotates into fixed-length segment files on disk and emits a
+  `segmentReady` event per finalized segment, so callers can upload/process each segment as it completes instead of
+  holding one large in-memory/on-disk blob for the whole session. iOS and Android both implement this mode with
+  equivalent behavior (gapless rotation, phone-call/interruption handling, and best-effort recovery of the
+  in-progress segment if the app is killed mid-session) — see [Platform behaviors](#platform-behaviors) below for the
+  platform-specific mechanics (foreground service on Android, background audio session on iOS).
 
 ## Installation
 
 ```
-pnpm add @independo/capacitor-voice-recorder
+pnpm add @easelynow/capacitor-audit-recorder
 pnpm exec cap sync
 ```
+
+> Within this monorepo, apps typically depend on this package via a `file:` reference to this directory (see
+> `operation-app/package.json`) rather than a published npm version, since the plugin and its consuming apps are
+> developed together. `pnpm exec cap sync` still applies after any native-side change.
 
 ### Configuration
 
@@ -35,6 +50,11 @@ Add the following to your `AndroidManifest.xml`:
 <uses-permission android:name="android.permission.RECORD_AUDIO"/>
 ```
 
+No further manifest changes are needed for continuous segmented recording — the plugin declares its own
+`FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_MICROPHONE` permissions and its foreground `Service`. See
+[Android segmented recording](#android-segmented-recording-continuous-audit-recordings) for details and the
+optional `POST_NOTIFICATIONS` recommendation on Android 13+.
+
 #### Using with iOS
 
 Add the following to your `Info.plist`:
@@ -44,23 +64,16 @@ Add the following to your `Info.plist`:
 <string>This app uses the microphone to record audio.</string>
 ```
 
+For continuous segmented recording to survive app backgrounding, also enable the `audio` background mode in
+`Info.plist` (`UIBackgroundModes` → `audio`), matching the `mixWithOthers` background-friendly audio session the
+plugin configures internally.
+
 ### Requirements
 
 - Capacitor 8+
 - iOS 15+
 - Android minSdk 26+; builds require Java 21 (recommended). `pnpm verify:android` requires a Java version supported
   by the bundled Gradle wrapper (currently Java 21–24, with Java 21 recommended).
-
-### Compatibility
-
-Versioning follows Capacitor versioning. Major versions of the plugin are compatible with major versions of Capacitor.
-
-| Plugin Version | Capacitor Version | Status     |
-|----------------|-------------------|------------|
-| 8.*            | 8                 | Active     |
-| 7.*            | 7                 | Deprecated |
-| 6.*            | 6                 | Deprecated |
-| 5.*            | 5                 | Deprecated |
 
 ### iOS Package Manager Support
 
@@ -74,7 +87,7 @@ This plugin supports both CocoaPods and Swift Package Manager (SPM) on iOS.
 Minimal flow for starting and stopping a recording:
 
 ```typescript
-import {VoiceRecorder} from '@independo/capacitor-voice-recorder';
+import {VoiceRecorder} from '@easelynow/capacitor-audit-recorder';
 
 export const startRecording = async () => {
     const permission = await VoiceRecorder.requestAudioRecordingPermission();
@@ -534,7 +547,7 @@ When a `uri` is present, `recordDataBase64` may be empty or omitted, so prefer `
 
 ```typescript
 import {Directory} from '@capacitor/filesystem';
-import {VoiceRecorder} from '@independo/capacitor-voice-recorder';
+import {VoiceRecorder} from '@easelynow/capacitor-audit-recorder';
 
 await VoiceRecorder.startRecording({
     directory: Directory.Cache,
@@ -598,8 +611,14 @@ platform.
 ## Origins and credit
 
 This project started as a fork of [
-`tchvu3/capacitor-voice-recorder`](https://github.com/tchvu3/capacitor-voice-recorder).
-Thanks to Avihu Harush for the original implementation and community groundwork. Since then, the plugin has been
-re-architected for improved performance, reliability, and testability (service/adapters split, contract tests, and a
-normalized response path). The codebase now diverges substantially, which is why this repo left the fork network.
-This plugin is maintained by [Independo GmbH](https://www.independo.app/).
+`tchvu3/capacitor-voice-recorder`](https://github.com/tchvu3/capacitor-voice-recorder). Thanks to Avihu Harush for
+the original implementation and community groundwork. [Independo GmbH](https://www.independo.app/) subsequently
+re-architected the plugin for improved performance, reliability, and testability (service/adapters split, contract
+tests, and a normalized response path) and maintained it as `@independo/capacitor-voice-recorder`.
+
+This repository is now maintained independently as `@easelynow/capacitor-audit-recorder`, extending that
+re-architected base with continuous segmented background recording for long-form audit sessions — gapless segment
+rotation, interruption/foreground-service handling, and crash-recovery semantics on both iOS and Android (see
+[Overview](#overview) and [Platform behaviors](#platform-behaviors)). The codebase diverges substantially from both
+upstream projects at this point, which is why it publishes under its own package name rather than tracking either
+fork.
