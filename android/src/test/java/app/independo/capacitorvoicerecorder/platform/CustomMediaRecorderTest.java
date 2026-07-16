@@ -6,7 +6,11 @@ import android.media.AudioManager;
 import android.media.MediaRecorder;
 import app.independo.capacitorvoicerecorder.core.CurrentRecordingStatus;
 import app.independo.capacitorvoicerecorder.core.RecordOptions;
+import app.independo.capacitorvoicerecorder.core.SegmentInfo;
+
 import java.io.File;
+import java.util.function.Consumer;
+
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -63,6 +67,12 @@ public class CustomMediaRecorderTest {
         };
         CustomMediaRecorder.SdkIntProvider sdkIntProvider = () -> sdkInt;
         CustomMediaRecorder.AudioFocusRequestFactory audioFocusRequestFactory = ignored -> focusRequest;
+        CustomMediaRecorder.MetadataRetrieverFactory metadataRetrieverFactory = () -> {
+            throw new UnsupportedOperationException("Not implemented for legacy tests");
+        };
+        CustomMediaRecorder.HandlerProvider handlerProvider = thread -> {
+            throw new UnsupportedOperationException("Not implemented for legacy tests");
+        };
         return new CustomMediaRecorder(
             context,
             options,
@@ -70,7 +80,9 @@ public class CustomMediaRecorderTest {
             audioManagerProvider,
             directoryProvider,
             sdkIntProvider,
-            audioFocusRequestFactory
+            audioFocusRequestFactory,
+            metadataRetrieverFactory,
+            handlerProvider
         );
     }
 

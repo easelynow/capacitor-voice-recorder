@@ -4,22 +4,46 @@ import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.MediaMetadataRetriever;
 import android.media.MediaRecorder;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.SystemClock;
 import app.independo.capacitorvoicerecorder.adapters.RecorderAdapter;
 import app.independo.capacitorvoicerecorder.core.CurrentRecordingStatus;
 import app.independo.capacitorvoicerecorder.core.RecordOptions;
+import app.independo.capacitorvoicerecorder.core.SegmentInfo;
+
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** MediaRecorder wrapper that manages audio focus and interruptions. */
+/** MediaRecorder wrapper that manages audio focus, interruptions, and (in segmented mode) gapless segment rotation.
+ *
+ * <p>Segmented-mode state (mediaRecorder, outputFile, nextOutputFile, currentSegmentIndex,
+ * rotationPending, segmentStartTimeMs, remainingSegmentTimeMs, currentRecordingStatus) is only ever
+ * mutated on {@link #rotationHandlerThread}. The MediaRecorder instance used in segmented mode is
+ * created on that same thread so that {@code OnInfoListener} callbacks (which Android binds to the
+ * thread that constructed the MediaRecorder) are also serialized onto it. Public methods called from
+ * other threads (the Capacitor bridge thread) dispatch onto the rotation thread and block for the
+ * result via {@link #runOnRotationThread(Callable)} — the Android analogue of iOS's
+ * {@code stateQueue.sync}. Legacy (non-segmented) mode never creates a rotation thread, so all legacy
+ * calls execute synchronously on the caller's thread exactly as before this class supported
+ * segmentation. */
 public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListener, RecorderAdapter {
 
-    /** Maximum amplitude value reported by Android MediaRecorder.getMaxAmplitude(). */
     private static final double MAX_MEDIA_RECORDER_AMPLITUDE = 32767.0;
+    private static final String MIME_TYPE_MP4 = "audio/mp4";
+    private static final String EXTENSION_MP4 = ".m4a";
+    private static final long ROTATION_THREAD_TIMEOUT_SECONDS = 5;
 
     interface MediaRecorderFactory {
         MediaRecorder create();
@@ -31,13 +55,9 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
 
     interface DirectoryProvider {
         File getDocumentsDirectory();
-
         File getFilesDir(Context context);
-
         File getCacheDir(Context context);
-
         File getExternalFilesDir(Context context);
-
         File getExternalStorageDirectory();
     }
 
@@ -47,6 +67,14 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
 
     interface AudioFocusRequestFactory {
         AudioFocusRequest create(AudioManager.OnAudioFocusChangeListener listener);
+    }
+
+    interface MetadataRetrieverFactory {
+        MediaMetadataRetriever create();
+    }
+
+    interface HandlerProvider {
+        Handler createHandler(HandlerThread thread);
     }
 
     private static final class DefaultMediaRecorderFactory implements MediaRecorderFactory {
@@ -112,32 +140,52 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
     }
 
-    /** Android context for file paths and system services. */
+    private static final class DefaultMetadataRetrieverFactory implements MetadataRetrieverFactory {
+        @Override
+        public MediaMetadataRetriever create() {
+            return new MediaMetadataRetriever();
+        }
+    }
+
+    private static final class DefaultHandlerProvider implements HandlerProvider {
+        @Override
+        public Handler createHandler(HandlerThread thread) {
+            return new Handler(thread.getLooper());
+        }
+    }
+
     private final Context context;
-    /** Recording options passed from the service layer. */
     private final RecordOptions options;
-    /** Factory for MediaRecorder instances. */
     private final MediaRecorderFactory mediaRecorderFactory;
-    /** Directory provider for file output. */
     private final DirectoryProvider directoryProvider;
-    /** SDK version provider for API gating. */
     private final SdkIntProvider sdkIntProvider;
-    /** Audio focus request factory for O and above. */
     private final AudioFocusRequestFactory audioFocusRequestFactory;
-    /** Active MediaRecorder instance for the session. */
+    private final MetadataRetrieverFactory metadataRetrieverFactory;
+    private final HandlerProvider handlerProvider;
     private MediaRecorder mediaRecorder;
-    /** Output file for the current recording session. */
     private File outputFile;
-    /** Current session status tracked locally. */
-    private CurrentRecordingStatus currentRecordingStatus = CurrentRecordingStatus.NONE;
-    /** Audio manager for focus changes. */
+    private volatile CurrentRecordingStatus currentRecordingStatus = CurrentRecordingStatus.NONE;
     private AudioManager audioManager;
-    /** Focus request for Android O and above. */
     private AudioFocusRequest audioFocusRequest;
-    /** Callback invoked when an interruption begins. */
     private Runnable onInterruptionBegan;
-    /** Callback invoked when an interruption ends. */
     private Runnable onInterruptionEnded;
+    private Consumer<SegmentInfo> onSegmentReady;
+
+    /** True for the lifetime of this instance when constructed with valid segmentDurationMs/sessionId/directory. */
+    private final boolean isSegmentedMode;
+    /** Dedicated thread that owns all segmented-mode state. The MediaRecorder used in segmented mode
+     *  is created on this thread so MediaRecorder.OnInfoListener callbacks land here too. */
+    private HandlerThread rotationHandlerThread;
+    private Handler rotationHandler;
+    private int currentSegmentIndex;
+    private File nextOutputFile;
+    private boolean rotationPending;
+    private Runnable rotationRunnable;
+    /** Wall-clock (elapsedRealtime) at which the current segment's rotation window started. */
+    private long segmentStartTimeMs;
+    /** Remaining time in the current segment's rotation window, captured on pause/interruption so
+     *  resume continues the same window instead of restarting a full segmentDurationMs window. */
+    private long remainingSegmentTimeMs;
 
     public CustomMediaRecorder(Context context, RecordOptions options) throws IOException {
         this(
@@ -147,7 +195,9 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             new DefaultAudioManagerProvider(),
             new DefaultDirectoryProvider(),
             new DefaultSdkIntProvider(),
-            new DefaultAudioFocusRequestFactory()
+            new DefaultAudioFocusRequestFactory(),
+            new DefaultMetadataRetrieverFactory(),
+            new DefaultHandlerProvider()
         );
     }
 
@@ -158,7 +208,9 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         AudioManagerProvider audioManagerProvider,
         DirectoryProvider directoryProvider,
         SdkIntProvider sdkIntProvider,
-        AudioFocusRequestFactory audioFocusRequestFactory
+        AudioFocusRequestFactory audioFocusRequestFactory,
+        MetadataRetrieverFactory metadataRetrieverFactory,
+        HandlerProvider handlerProvider
     ) throws IOException {
         this.context = context;
         this.options = options;
@@ -166,21 +218,298 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         this.directoryProvider = directoryProvider;
         this.sdkIntProvider = sdkIntProvider;
         this.audioFocusRequestFactory = audioFocusRequestFactory;
+        this.metadataRetrieverFactory = metadataRetrieverFactory;
+        this.handlerProvider = handlerProvider;
         this.audioManager = audioManagerProvider.getAudioManager(context);
-        generateMediaRecorder();
+
+        this.isSegmentedMode = isSegmentedRecording();
+
+        if (isSegmentedMode) {
+            rotationHandlerThread = new HandlerThread("SegmentRotationThread");
+            rotationHandlerThread.start();
+            rotationHandler = handlerProvider.createHandler(rotationHandlerThread);
+            try {
+                // Created ON rotationHandlerThread so MediaRecorder binds its OnInfoListener
+                // callback thread to it (Android posts info callbacks to the thread that
+                // constructed the MediaRecorder, when that thread has a Looper).
+                runOnRotationThread(() -> {
+                    initializeSegmentedRecorder();
+                    return null;
+                });
+            } catch (RuntimeException e) {
+                rotationHandlerThread.quitSafely();
+                rotationHandlerThread = null;
+                rotationHandler = null;
+                if (e.getCause() instanceof IOException) {
+                    throw (IOException) e.getCause();
+                }
+                throw e;
+            }
+        } else {
+            generateMediaRecorder();
+        }
     }
 
-    /** Sets the callback for interruption begin events. */
-    public void setOnInterruptionBegan(Runnable callback) {
-        this.onInterruptionBegan = callback;
+    /** Backward-compat 7-arg constructor used by legacy (pre-segmentation) test doubles.
+     *  Always constructs in legacy (non-segmented) mode semantics via the delegating options. */
+    CustomMediaRecorder(
+        Context context,
+        RecordOptions options,
+        MediaRecorderFactory mediaRecorderFactory,
+        AudioManagerProvider audioManagerProvider,
+        DirectoryProvider directoryProvider,
+        SdkIntProvider sdkIntProvider,
+        AudioFocusRequestFactory audioFocusRequestFactory
+    ) throws IOException {
+        this(
+            context,
+            options,
+            mediaRecorderFactory,
+            audioManagerProvider,
+            directoryProvider,
+            sdkIntProvider,
+            audioFocusRequestFactory,
+            new DefaultMetadataRetrieverFactory(),
+            new DefaultHandlerProvider()
+        );
     }
 
-    /** Sets the callback for interruption end events. */
-    public void setOnInterruptionEnded(Runnable callback) {
-        this.onInterruptionEnded = callback;
+    /** Dispatches {@code action} onto {@link #rotationHandlerThread} and blocks for its result.
+     *  In legacy (non-segmented) mode, or when already running on the rotation thread, executes
+     *  {@code action} directly on the caller's thread — a no-op passthrough. This is the single
+     *  synchronization point for all segmented-mode state mutation (the Android analogue of
+     *  iOS's {@code stateQueue.sync}). */
+    private <T> T runOnRotationThread(Callable<T> action) {
+        if (!isSegmentedMode || rotationHandler == null || Thread.currentThread() == rotationHandlerThread) {
+            try {
+                return action.call();
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        CountDownLatch latch = new CountDownLatch(1);
+        Object[] resultHolder = new Object[1];
+        Throwable[] errorHolder = new Throwable[1];
+        rotationHandler.post(() -> {
+            try {
+                resultHolder[0] = action.call();
+            } catch (Throwable t) {
+                errorHolder[0] = t;
+            } finally {
+                latch.countDown();
+            }
+        });
+
+        try {
+            if (!latch.await(ROTATION_THREAD_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new RuntimeException("Timed out waiting for the recorder rotation thread");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+
+        if (errorHolder[0] != null) {
+            Throwable error = errorHolder[0];
+            if (error instanceof RuntimeException) {
+                throw (RuntimeException) error;
+            }
+            throw new RuntimeException(error);
+        }
+
+        @SuppressWarnings("unchecked")
+        T result = (T) resultHolder[0];
+        return result;
     }
 
-    /** Configures the MediaRecorder with audio settings. */
+    private boolean isSegmentedRecording() {
+        Integer segmentDurationMs = options.segmentDurationMs();
+        String sessionId = options.sessionId();
+        String directory = options.directory();
+
+        return segmentDurationMs != null
+            && segmentDurationMs > 0
+            && directory != null
+            && sessionId != null
+            && !sessionId.isEmpty();
+    }
+
+    /** Runs on {@link #rotationHandlerThread}. Creates the MediaRecorder for segment 0 and arms
+     *  the OnInfoListener that seals rotated segments. */
+    private void initializeSegmentedRecorder() throws IOException {
+        mediaRecorder = mediaRecorderFactory.create();
+        mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+        mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+        mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+        mediaRecorder.setAudioEncodingBitRate(96000);
+        mediaRecorder.setAudioSamplingRate(44100);
+
+        File outputDir = resolveOutputDirectory();
+        String sessionId = options.sessionId();
+        currentSegmentIndex = 0;
+        outputFile = new File(outputDir, String.format("audio_%s_0%s", sessionId, EXTENSION_MP4));
+
+        mediaRecorder.setOutputFile(outputFile.getAbsolutePath());
+        mediaRecorder.setOnInfoListener((mr, what, extra) -> {
+            if (what == MediaRecorder.MEDIA_RECORDER_INFO_NEXT_OUTPUT_FILE_STARTED) {
+                // We are already on rotationHandlerThread here (see class javadoc); no dispatch needed.
+                handleSegmentRotationComplete();
+            }
+        });
+
+        mediaRecorder.prepare();
+    }
+
+    private File resolveOutputDirectory() throws IOException {
+        String directory = options.directory();
+        String subDirectory = options.subDirectory();
+
+        File outputDir = getDirectory(directory);
+
+        if (subDirectory != null) {
+            Pattern pattern = Pattern.compile("^/?(.+[^/])/?$");
+            Matcher matcher = pattern.matcher(subDirectory);
+            if (matcher.matches()) {
+                outputDir = new File(outputDir, matcher.group(1));
+                if (!outputDir.exists()) {
+                    outputDir.mkdirs();
+                }
+            }
+        }
+
+        return outputDir;
+    }
+
+    /** Runs on rotationHandlerThread. Requests a gapless rotation to the next segment file.
+     *  Broad catch: MediaRecorder.setNextOutputFile can throw unchecked IllegalStateException on
+     *  some OEMs/states; an uncaught exception here would crash the HandlerThread (and the app). */
+    private void requestSegmentRotation() {
+        if (mediaRecorder == null || currentRecordingStatus != CurrentRecordingStatus.RECORDING) {
+            return;
+        }
+
+        try {
+            String sessionId = options.sessionId();
+            int nextIndex = currentSegmentIndex + 1;
+            File outputDir = outputFile.getParentFile();
+            nextOutputFile = new File(outputDir, String.format("audio_%s_%d%s", sessionId, nextIndex, EXTENSION_MP4));
+
+            nextOutputFile.createNewFile();
+            mediaRecorder.setNextOutputFile(nextOutputFile);
+            rotationPending = true;
+        } catch (Exception e) {
+            // Matches iOS rotateSegment() failure handling: cancel the timer, mark INTERRUPTED so
+            // subsequent calls are safe, and notify JS rather than crashing the rotation thread.
+            rotationPending = false;
+            cancelRotationTimer();
+            currentRecordingStatus = CurrentRecordingStatus.INTERRUPTED;
+            if (onInterruptionBegan != null) {
+                onInterruptionBegan.run();
+            }
+        }
+    }
+
+    /** Runs on rotationHandlerThread (MediaRecorder.OnInfoListener callback thread). */
+    private void handleSegmentRotationComplete() {
+        if (!rotationPending) {
+            return;
+        }
+        rotationPending = false;
+
+        int durationMs = getSegmentDuration(outputFile);
+
+        if (onSegmentReady != null) {
+            SegmentInfo segmentInfo = new SegmentInfo(
+                options.sessionId(),
+                currentSegmentIndex,
+                Uri.fromFile(outputFile).toString(),
+                outputFile.getName(),
+                durationMs,
+                MIME_TYPE_MP4
+            );
+            onSegmentReady.accept(segmentInfo);
+        }
+
+        currentSegmentIndex++;
+        outputFile = nextOutputFile;
+        nextOutputFile = null;
+
+        scheduleFullRotation();
+    }
+
+    private int getSegmentDuration(File file) {
+        MediaMetadataRetriever retriever = null;
+        try {
+            retriever = metadataRetrieverFactory.create();
+            retriever.setDataSource(file.getAbsolutePath());
+            String durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+            if (durationStr != null) {
+                return (int) Long.parseLong(durationStr);
+            }
+        } catch (Exception e) {
+            // fall through to 0
+        } finally {
+            if (retriever != null) {
+                try {
+                    retriever.release();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+        return 0;
+    }
+
+    /** Schedules a fresh full-duration rotation window (used at recording start and after every
+     *  completed rotation). Resets both the remaining-time bookkeeping and the timer baseline. */
+    private void scheduleFullRotation() {
+        if (rotationHandler == null || rotationRunnable == null) {
+            return;
+        }
+
+        Integer segmentDurationMs = options.segmentDurationMs();
+        if (segmentDurationMs == null || segmentDurationMs <= 0) {
+            return;
+        }
+
+        remainingSegmentTimeMs = segmentDurationMs;
+        segmentStartTimeMs = SystemClock.elapsedRealtime();
+        rotationHandler.postDelayed(rotationRunnable, remainingSegmentTimeMs);
+    }
+
+    /** Resumes the rotation window using previously captured {@link #remainingSegmentTimeMs}
+     *  (set by {@link #captureRemainingSegmentTime()} on pause/interruption) instead of resetting
+     *  to a full segmentDurationMs window. Mirrors iOS's DispatchSourceTimer suspend/resume, which
+     *  natively preserves the remaining countdown; Handler.postDelayed has no such primitive, so
+     *  the remaining time is tracked manually here. */
+    private void scheduleRemainingRotation() {
+        if (rotationHandler == null || rotationRunnable == null) {
+            return;
+        }
+        segmentStartTimeMs = SystemClock.elapsedRealtime();
+        rotationHandler.postDelayed(rotationRunnable, Math.max(remainingSegmentTimeMs, 0));
+    }
+
+    /** Captures how much of the current rotation window remains, based on elapsed time since it
+     *  was last (re)scheduled. Called before cancelling the timer on pause/interruption. */
+    private void captureRemainingSegmentTime() {
+        Integer segmentDurationMs = options.segmentDurationMs();
+        if (segmentDurationMs == null) {
+            remainingSegmentTimeMs = 0;
+            return;
+        }
+        long elapsed = SystemClock.elapsedRealtime() - segmentStartTimeMs;
+        remainingSegmentTimeMs = Math.max(segmentDurationMs - elapsed, 0);
+    }
+
+    private void cancelRotationTimer() {
+        if (rotationHandler != null && rotationRunnable != null) {
+            rotationHandler.removeCallbacks(rotationRunnable);
+        }
+    }
+
     private void generateMediaRecorder() throws IOException {
         mediaRecorder = mediaRecorderFactory.create();
         mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
@@ -192,7 +521,6 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         mediaRecorder.prepare();
     }
 
-    /** Picks a directory and allocates the output file for this session. */
     private void setRecorderOutputFile() throws IOException {
         File outputDir = directoryProvider.getCacheDir(context);
 
@@ -200,7 +528,7 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         String subDirectory = options.subDirectory();
 
         if (directory != null) {
-            outputDir = this.getDirectory(directory);
+            outputDir = getDirectory(directory);
             if (subDirectory != null) {
                 Pattern pattern = Pattern.compile("^/?(.+[^/])/?$");
                 Matcher matcher = pattern.matcher(subDirectory);
@@ -222,7 +550,6 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         mediaRecorder.setOutputFile(outputFile.getAbsolutePath());
     }
 
-    /** Maps directory strings to Android file locations. */
     private File getDirectory(String directory) {
         return switch (directory) {
             case "DOCUMENTS" -> directoryProvider.getDocumentsDirectory();
@@ -234,15 +561,38 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         };
     }
 
-    /** Starts recording and requests audio focus. */
+    @Override
     public void startRecording() {
+        runOnRotationThread(() -> {
+            startRecordingLocked();
+            return null;
+        });
+    }
+
+    private void startRecordingLocked() {
         requestAudioFocus();
         mediaRecorder.start();
         currentRecordingStatus = CurrentRecordingStatus.RECORDING;
+
+        if (isSegmentedMode) {
+            rotationRunnable = this::requestSegmentRotation;
+            scheduleFullRotation();
+        }
     }
 
-    /** Stops recording and releases audio resources. */
+    @Override
     public void stopRecording() {
+        runOnRotationThread(() -> {
+            stopRecordingLocked();
+            return null;
+        });
+    }
+
+    private void stopRecordingLocked() {
+        if (isSegmentedMode) {
+            cancelRotationTimer();
+        }
+
         if (mediaRecorder == null) {
             abandonAudioFocus();
             currentRecordingStatus = CurrentRecordingStatus.NONE;
@@ -254,6 +604,19 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
                 || currentRecordingStatus == CurrentRecordingStatus.PAUSED
                 || currentRecordingStatus == CurrentRecordingStatus.INTERRUPTED) {
                 mediaRecorder.stop();
+
+                if (isSegmentedMode && onSegmentReady != null) {
+                    int durationMs = getSegmentDuration(outputFile);
+                    SegmentInfo segmentInfo = new SegmentInfo(
+                        options.sessionId(),
+                        currentSegmentIndex,
+                        Uri.fromFile(outputFile).toString(),
+                        outputFile.getName(),
+                        durationMs,
+                        MIME_TYPE_MP4
+                    );
+                    onSegmentReady.accept(segmentInfo);
+                }
             }
         } catch (IllegalStateException ignore) {
         } finally {
@@ -261,27 +624,42 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             mediaRecorder = null;
             abandonAudioFocus();
             currentRecordingStatus = CurrentRecordingStatus.NONE;
+
+            if (rotationHandlerThread != null) {
+                rotationHandlerThread.quitSafely();
+                rotationHandlerThread = null;
+                rotationHandler = null;
+            }
         }
     }
 
-    /** Returns the output file for the current session. */
+    @Override
     public File getOutputFile() {
         return outputFile;
     }
 
-    /** Returns the options provided at start time. */
+    @Override
     public RecordOptions getRecordOptions() {
         return options;
     }
 
-    /** Pauses recording when supported by the OS version. */
+    @Override
     public boolean pauseRecording() throws NotSupportedOsVersion {
         if (sdkIntProvider.getSdkInt() < Build.VERSION_CODES.N) {
             throw new NotSupportedOsVersion();
         }
+        return runOnRotationThread(this::pauseRecordingLocked);
+    }
 
+    private boolean pauseRecordingLocked() {
         if (currentRecordingStatus == CurrentRecordingStatus.RECORDING) {
             mediaRecorder.pause();
+
+            if (isSegmentedMode) {
+                captureRemainingSegmentTime();
+                cancelRotationTimer();
+            }
+
             currentRecordingStatus = CurrentRecordingStatus.PAUSED;
             return true;
         } else {
@@ -289,28 +667,36 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
     }
 
-    /** Resumes a paused or interrupted recording session. */
+    @Override
     public boolean resumeRecording() throws NotSupportedOsVersion {
         if (sdkIntProvider.getSdkInt() < Build.VERSION_CODES.N) {
             throw new NotSupportedOsVersion();
         }
+        return runOnRotationThread(this::resumeRecordingLocked);
+    }
 
+    private boolean resumeRecordingLocked() {
         if (currentRecordingStatus == CurrentRecordingStatus.PAUSED || currentRecordingStatus == CurrentRecordingStatus.INTERRUPTED) {
             requestAudioFocus();
             mediaRecorder.resume();
             currentRecordingStatus = CurrentRecordingStatus.RECORDING;
+
+            if (isSegmentedMode) {
+                scheduleRemainingRotation();
+            }
+
             return true;
         } else {
             return false;
         }
     }
 
-    /** Returns the current recording status. */
+    @Override
     public CurrentRecordingStatus getCurrentStatus() {
         return currentRecordingStatus;
     }
 
-    /** Returns the current input amplitude normalized to [0, 1]. */
+    @Override
     public double getCurrentAmplitude() {
         if (currentRecordingStatus != CurrentRecordingStatus.RECORDING || mediaRecorder == null) {
             return 0;
@@ -323,17 +709,15 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
     }
 
-    /** Deletes the output file from disk. */
+    @Override
     public boolean deleteOutputFile() {
-        return outputFile.delete();
+        return outputFile != null && outputFile.delete();
     }
 
-    /** Simple capability check used for device validation. */
     public static boolean canPhoneCreateMediaRecorder(Context context) {
         return true;
     }
 
-    /** Attempts to record a short sample to validate permission and hardware. */
     private static boolean canPhoneCreateMediaRecorderWhileHavingPermission(Context context) {
         CustomMediaRecorder tempMediaRecorder = null;
         try {
@@ -348,7 +732,6 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
     }
 
-    /** Requests audio focus for the recording session. */
     private void requestAudioFocus() {
         if (audioManager == null) {
             return;
@@ -362,7 +745,6 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
     }
 
-    /** Releases audio focus when recording completes. */
     private void abandonAudioFocus() {
         if (audioManager == null) {
             return;
@@ -376,7 +758,6 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
     }
 
-    /** Clamps platform-specific amplitude calculations into the public range. */
     private static double clampAmplitude(double value) {
         if (Double.isNaN(value) || Double.isInfinite(value)) {
             return 0;
@@ -384,36 +765,151 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         return Math.min(1, Math.max(0, value));
     }
 
-    /** Handles audio focus changes as recording interruptions. */
     @Override
     public void onAudioFocusChange(int focusChange) {
         switch (focusChange) {
             case AudioManager.AUDIOFOCUS_LOSS:
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
-                // For voice recording, ducking still degrades captured audio, so treat all loss types as interruptions.
-                if (currentRecordingStatus == CurrentRecordingStatus.RECORDING) {
-                    try {
-                        if (sdkIntProvider.getSdkInt() >= Build.VERSION_CODES.N) {
-                            mediaRecorder.pause();
-                            currentRecordingStatus = CurrentRecordingStatus.INTERRUPTED;
-                            if (onInterruptionBegan != null) {
-                                onInterruptionBegan.run();
-                            }
-                        }
-                    } catch (Exception ignore) {
-                    }
-                }
+                runOnRotationThread(() -> {
+                    handleAudioFocusLossLocked();
+                    return null;
+                });
                 break;
             case AudioManager.AUDIOFOCUS_GAIN:
-                if (currentRecordingStatus == CurrentRecordingStatus.INTERRUPTED) {
-                    if (onInterruptionEnded != null) {
-                        onInterruptionEnded.run();
-                    }
-                }
+                runOnRotationThread(() -> {
+                    handleAudioFocusGainLocked();
+                    return null;
+                });
                 break;
             default:
                 break;
+        }
+    }
+
+    private void handleAudioFocusLossLocked() {
+        // For voice recording, ducking still degrades captured audio, so treat all loss types as interruptions.
+        if (currentRecordingStatus == CurrentRecordingStatus.RECORDING) {
+            try {
+                if (sdkIntProvider.getSdkInt() >= Build.VERSION_CODES.N) {
+                    mediaRecorder.pause();
+                    currentRecordingStatus = CurrentRecordingStatus.INTERRUPTED;
+
+                    if (isSegmentedMode) {
+                        captureRemainingSegmentTime();
+                        cancelRotationTimer();
+                    }
+
+                    if (onInterruptionBegan != null) {
+                        onInterruptionBegan.run();
+                    }
+                }
+            } catch (Exception ignore) {
+            }
+        }
+    }
+
+    private void handleAudioFocusGainLocked() {
+        if (currentRecordingStatus == CurrentRecordingStatus.INTERRUPTED) {
+            if (onInterruptionEnded != null) {
+                onInterruptionEnded.run();
+            }
+        }
+    }
+
+    public void setOnInterruptionBegan(Runnable callback) {
+        this.onInterruptionBegan = callback;
+    }
+
+    public void setOnInterruptionEnded(Runnable callback) {
+        this.onInterruptionEnded = callback;
+    }
+
+    @Override
+    public void setOnSegmentReady(Consumer<SegmentInfo> callback) {
+        this.onSegmentReady = callback;
+    }
+
+    @Override
+    public void flushCurrentSegment(boolean terminating, Consumer<SegmentInfo> completion) {
+        runOnRotationThread(() -> {
+            flushCurrentSegmentLocked(terminating, completion);
+            return null;
+        });
+    }
+
+    private void flushCurrentSegmentLocked(boolean terminating, Consumer<SegmentInfo> completion) {
+        if (!isSegmentedMode || currentRecordingStatus != CurrentRecordingStatus.RECORDING) {
+            if (completion != null) {
+                completion.accept(null);
+            }
+            return;
+        }
+
+        try {
+            mediaRecorder.stop();
+
+            int durationMs = getSegmentDuration(outputFile);
+            SegmentInfo segmentInfo = new SegmentInfo(
+                options.sessionId(),
+                currentSegmentIndex,
+                Uri.fromFile(outputFile).toString(),
+                outputFile.getName(),
+                durationMs,
+                MIME_TYPE_MP4
+            );
+            if (onSegmentReady != null) {
+                onSegmentReady.accept(segmentInfo);
+            }
+
+            if (terminating) {
+                mediaRecorder.release();
+                mediaRecorder = null;
+                currentRecordingStatus = CurrentRecordingStatus.NONE;
+                cancelRotationTimer();
+
+                if (rotationHandlerThread != null) {
+                    rotationHandlerThread.quitSafely();
+                    rotationHandlerThread = null;
+                    rotationHandler = null;
+                }
+
+                if (completion != null) {
+                    completion.accept(segmentInfo);
+                }
+            } else {
+                currentSegmentIndex++;
+
+                String sessionId = options.sessionId();
+                File outputDir = outputFile.getParentFile();
+                outputFile = new File(outputDir, String.format("audio_%s_%d%s", sessionId, currentSegmentIndex, EXTENSION_MP4));
+
+                mediaRecorder = mediaRecorderFactory.create();
+                mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+                mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                mediaRecorder.setAudioEncodingBitRate(96000);
+                mediaRecorder.setAudioSamplingRate(44100);
+                mediaRecorder.setOutputFile(outputFile.getAbsolutePath());
+                mediaRecorder.setOnInfoListener((mr, what, extra) -> {
+                    if (what == MediaRecorder.MEDIA_RECORDER_INFO_NEXT_OUTPUT_FILE_STARTED) {
+                        handleSegmentRotationComplete();
+                    }
+                });
+
+                mediaRecorder.prepare();
+                mediaRecorder.start();
+
+                scheduleFullRotation();
+
+                if (completion != null) {
+                    completion.accept(segmentInfo);
+                }
+            }
+        } catch (Exception e) {
+            if (completion != null) {
+                completion.accept(null);
+            }
         }
     }
 }
