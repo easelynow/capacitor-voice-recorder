@@ -6,7 +6,6 @@ import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaMetadataRetriever;
 import android.media.MediaRecorder;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
@@ -75,6 +74,17 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
 
     interface HandlerProvider {
         Handler createHandler(HandlerThread thread);
+    }
+
+    interface HandlerThreadFactory {
+        HandlerThread create(String name);
+    }
+
+    /** Monotonic clock abstraction for rotation-timer bookkeeping. Exists purely so unit tests can
+     *  avoid calling the real android.os.SystemClock (which throws under the AGP unit-test stub jar
+     *  without Robolectric — "Method elapsedRealtime in android.os.SystemClock not mocked"). */
+    interface TimeProvider {
+        long elapsedRealtimeMs();
     }
 
     private static final class DefaultMediaRecorderFactory implements MediaRecorderFactory {
@@ -154,6 +164,20 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
     }
 
+    private static final class DefaultHandlerThreadFactory implements HandlerThreadFactory {
+        @Override
+        public HandlerThread create(String name) {
+            return new HandlerThread(name);
+        }
+    }
+
+    private static final class DefaultTimeProvider implements TimeProvider {
+        @Override
+        public long elapsedRealtimeMs() {
+            return SystemClock.elapsedRealtime();
+        }
+    }
+
     private final Context context;
     private final RecordOptions options;
     private final MediaRecorderFactory mediaRecorderFactory;
@@ -162,6 +186,8 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
     private final AudioFocusRequestFactory audioFocusRequestFactory;
     private final MetadataRetrieverFactory metadataRetrieverFactory;
     private final HandlerProvider handlerProvider;
+    private final HandlerThreadFactory handlerThreadFactory;
+    private final TimeProvider timeProvider;
     private MediaRecorder mediaRecorder;
     private File outputFile;
     private volatile CurrentRecordingStatus currentRecordingStatus = CurrentRecordingStatus.NONE;
@@ -197,7 +223,9 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             new DefaultSdkIntProvider(),
             new DefaultAudioFocusRequestFactory(),
             new DefaultMetadataRetrieverFactory(),
-            new DefaultHandlerProvider()
+            new DefaultHandlerProvider(),
+            new DefaultTimeProvider(),
+            new DefaultHandlerThreadFactory()
         );
     }
 
@@ -210,7 +238,9 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         SdkIntProvider sdkIntProvider,
         AudioFocusRequestFactory audioFocusRequestFactory,
         MetadataRetrieverFactory metadataRetrieverFactory,
-        HandlerProvider handlerProvider
+        HandlerProvider handlerProvider,
+        TimeProvider timeProvider,
+        HandlerThreadFactory handlerThreadFactory
     ) throws IOException {
         this.context = context;
         this.options = options;
@@ -220,12 +250,14 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         this.audioFocusRequestFactory = audioFocusRequestFactory;
         this.metadataRetrieverFactory = metadataRetrieverFactory;
         this.handlerProvider = handlerProvider;
+        this.timeProvider = timeProvider;
+        this.handlerThreadFactory = handlerThreadFactory;
         this.audioManager = audioManagerProvider.getAudioManager(context);
 
         this.isSegmentedMode = isSegmentedRecording();
 
         if (isSegmentedMode) {
-            rotationHandlerThread = new HandlerThread("SegmentRotationThread");
+            rotationHandlerThread = handlerThreadFactory.create("SegmentRotationThread");
             rotationHandlerThread.start();
             rotationHandler = handlerProvider.createHandler(rotationHandlerThread);
             try {
@@ -270,7 +302,9 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             sdkIntProvider,
             audioFocusRequestFactory,
             new DefaultMetadataRetrieverFactory(),
-            new DefaultHandlerProvider()
+            new DefaultHandlerProvider(),
+            new DefaultTimeProvider(),
+            new DefaultHandlerThreadFactory()
         );
     }
 
@@ -335,6 +369,14 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             && directory != null
             && sessionId != null
             && !sessionId.isEmpty();
+    }
+
+    /** Builds a {@code file://}-prefixed URI string for a local absolute path without calling
+     *  android.net.Uri (whose static factory methods throw under the AGP unit-test stub jar).
+     *  Equivalent to {@code Uri.fromFile(file).toString()} for local files: no authority, so the
+     *  scheme is followed directly by the absolute path (which itself starts with "/"). */
+    private static String toFileUriString(File file) {
+        return "file://" + file.getAbsolutePath();
     }
 
     /** Runs on {@link #rotationHandlerThread}. Creates the MediaRecorder for segment 0 and arms
@@ -425,7 +467,7 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             SegmentInfo segmentInfo = new SegmentInfo(
                 options.sessionId(),
                 currentSegmentIndex,
-                Uri.fromFile(outputFile).toString(),
+                toFileUriString(outputFile),
                 outputFile.getName(),
                 durationMs,
                 MIME_TYPE_MP4
@@ -475,7 +517,7 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         }
 
         remainingSegmentTimeMs = segmentDurationMs;
-        segmentStartTimeMs = SystemClock.elapsedRealtime();
+        segmentStartTimeMs = timeProvider.elapsedRealtimeMs();
         rotationHandler.postDelayed(rotationRunnable, remainingSegmentTimeMs);
     }
 
@@ -488,7 +530,7 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         if (rotationHandler == null || rotationRunnable == null) {
             return;
         }
-        segmentStartTimeMs = SystemClock.elapsedRealtime();
+        segmentStartTimeMs = timeProvider.elapsedRealtimeMs();
         rotationHandler.postDelayed(rotationRunnable, Math.max(remainingSegmentTimeMs, 0));
     }
 
@@ -500,7 +542,7 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             remainingSegmentTimeMs = 0;
             return;
         }
-        long elapsed = SystemClock.elapsedRealtime() - segmentStartTimeMs;
+        long elapsed = timeProvider.elapsedRealtimeMs() - segmentStartTimeMs;
         remainingSegmentTimeMs = Math.max(segmentDurationMs - elapsed, 0);
     }
 
@@ -610,7 +652,7 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
                     SegmentInfo segmentInfo = new SegmentInfo(
                         options.sessionId(),
                         currentSegmentIndex,
-                        Uri.fromFile(outputFile).toString(),
+                        toFileUriString(outputFile),
                         outputFile.getName(),
                         durationMs,
                         MIME_TYPE_MP4
@@ -853,7 +895,7 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
             SegmentInfo segmentInfo = new SegmentInfo(
                 options.sessionId(),
                 currentSegmentIndex,
-                Uri.fromFile(outputFile).toString(),
+                toFileUriString(outputFile),
                 outputFile.getName(),
                 durationMs,
                 MIME_TYPE_MP4

@@ -73,6 +73,9 @@ public class CustomMediaRecorderTest {
         CustomMediaRecorder.HandlerProvider handlerProvider = thread -> {
             throw new UnsupportedOperationException("Not implemented for legacy tests");
         };
+        CustomMediaRecorder.TimeProvider timeProvider = () -> {
+            throw new UnsupportedOperationException("Not implemented for legacy tests");
+        };
         return new CustomMediaRecorder(
             context,
             options,
@@ -82,7 +85,11 @@ public class CustomMediaRecorderTest {
             sdkIntProvider,
             audioFocusRequestFactory,
             metadataRetrieverFactory,
-            handlerProvider
+            handlerProvider,
+            timeProvider,
+            (CustomMediaRecorder.HandlerThreadFactory) name -> {
+                throw new UnsupportedOperationException("Not implemented for legacy tests");
+            }
         );
     }
 
