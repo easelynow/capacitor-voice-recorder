@@ -39,7 +39,8 @@ final class VoiceRecorderService {
     func startRecording(
         options: RecordOptions?,
         onInterruptionBegan: @escaping () -> Void,
-        onInterruptionEnded: @escaping () -> Void
+        onInterruptionEnded: @escaping () -> Void,
+        onSegmentReady: @escaping (SegmentInfo) -> Void = { _ in }
     ) throws {
         if !platform.canDeviceVoiceRecord() {
             throw VoiceRecorderServiceError(code: ErrorCodes.deviceCannotVoiceRecord)
@@ -53,9 +54,10 @@ final class VoiceRecorderService {
             throw VoiceRecorderServiceError(code: ErrorCodes.alreadyRecording)
         }
 
-        let nextRecorder = recorderFactory()
+        let nextRecorder = self.recorderFactory()
         nextRecorder.onInterruptionBegan = onInterruptionBegan
         nextRecorder.onInterruptionEnded = onInterruptionEnded
+        nextRecorder.onSegmentReady = onSegmentReady
         let started = nextRecorder.startRecording(recordOptions: options)
         if !started {
             recorder = nil
@@ -137,5 +139,15 @@ final class VoiceRecorderService {
             return 0
         }
         return recorder.getCurrentAmplitude()
+    }
+
+    /// Flushes the active segment without stopping the session.
+    /// terminating: when true, stops recorder without restarting (app is dying).
+    func flushCurrentSegment(terminating: Bool = false, completion: @escaping (SegmentInfo?) -> Void) {
+        guard let recorder = recorder else {
+            completion(nil)
+            return
+        }
+        recorder.flushCurrentSegment(terminating: terminating, completion: completion)
     }
 }

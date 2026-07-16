@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "IndependoCapacitorVoiceRecorder",
+    name: "EaselynowCapacitorAuditRecorder",
     platforms: [.iOS(.v15)],
     products: [
         .library(
-            name: "IndependoCapacitorVoiceRecorder",
+            name: "EaselynowCapacitorAuditRecorder",
             targets: ["VoiceRecorder"])
     ],
     dependencies: [

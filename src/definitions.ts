@@ -34,6 +34,26 @@ export interface RecordingOptions {
      * Native platforms ignore this option.
      */
     requirePlaybackSupport?: boolean;
+
+    /**
+     * When set to a positive number of milliseconds, native platforms record in
+     * CONTINUOUS SEGMENTED mode: the recorder auto-finalizes a segment file every
+     * `segmentDurationMs` and immediately starts the next one, emitting a
+     * `segmentReady` event per finalized segment. Requires `directory` to be set so
+     * segments are written to disk. Designed for long (30-90 min) background audit
+     * recordings without holding a large in-memory blob.
+     *
+     * If omitted or `0`, the recorder behaves as a single-file recording (legacy).
+     * Web honors this via `MediaRecorder` timeslice; interruption-based segmentation
+     * on iOS is independent of this value.
+     */
+    segmentDurationMs?: number;
+
+    /**
+     * Correlation id stamped onto every `segmentReady` event for this recording
+     * session (e.g. the audit session UUID). Native echoes it back unmodified.
+     */
+    sessionId?: string;
 }
 
 /**
@@ -107,6 +127,25 @@ export type VoiceRecordingInterruptedEvent = Record<string, never>;
  * Event payload for voiceRecordingInterruptionEnded event (empty - no data).
  */
 export type VoiceRecordingInterruptionEndedEvent = Record<string, never>;
+
+/**
+ * Event payload for the `segmentReady` event. Emitted each time a continuous
+ * segmented recording finalizes a `segmentDurationMs`-long chunk to disk.
+ */
+export interface SegmentReadyEvent {
+    /** Correlation id passed in `RecordingOptions.sessionId` (may be empty). */
+    sessionId: string;
+    /** 0-based segment index — the canonical ordering key for stitching. */
+    index: number;
+    /** Capacitor filesystem URI of the finalized segment file. */
+    uri: string;
+    /** File name of the segment (e.g. `audio_{sessionId}_{index}.m4a`). */
+    fileName: string;
+    /** Audio content duration of this segment in milliseconds. */
+    msDuration: number;
+    /** MIME type of the segment file (iOS: `audio/mp4`). */
+    mimeType: string;
+}
 
 /**
  * Interface for the VoiceRecorderPlugin which provides methods to record audio.
@@ -237,6 +276,21 @@ export interface VoiceRecorderPlugin {
     addListener(
         eventName: 'voiceRecordingInterruptionEnded',
         listenerFunc: (event: VoiceRecordingInterruptionEndedEvent) => void,
+    ): Promise<PluginListenerHandle>;
+
+    /**
+     * Listen for finalized recording segments in continuous segmented mode
+     * (see `RecordingOptions.segmentDurationMs`). Fires once per completed segment
+     * plus once for the final (partial) segment on `stopRecording()`.
+     * Available on iOS and Android only.
+     *
+     * @param eventName The name of the event to listen for.
+     * @param listenerFunc The callback invoked with the segment details.
+     * @returns A promise that resolves to a PluginListenerHandle.
+     */
+    addListener(
+        eventName: 'segmentReady',
+        listenerFunc: (event: SegmentReadyEvent) => void,
     ): Promise<PluginListenerHandle>;
 
     /**

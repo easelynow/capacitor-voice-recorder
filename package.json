@@ -10,10 +10,10 @@
   "prettier": "@ionic/prettier-config",
   "repository": {
     "type": "git",
-    "url": "https://github.com/independo-gmbh/capacitor-voice-recorder.git"
+    "url": "https://github.com/easelynow/capacitor-audit-recorder.git"
   },
-  "description": "Capacitor plugin for voice recording",
-  "version": "8.3.3",
+  "description": "Capacitor plugin for continuous background audit voice recording (segmented)",
+  "version": "0.1.0",
   "packageManager": "pnpm@11.8.0",
   "devDependencies": {
     "@capacitor/android": "catalog:",
@@ -45,7 +45,7 @@
     "android/src/main/",
     "android/build.gradle",
     "dist/",
-    "IndependoCapacitorVoiceRecorder.podspec",
+    "EaselynowCapacitorAuditRecorder.podspec",
     "ios/Sources",
     "Package.swift"
   ],
@@ -61,7 +61,7 @@
     "prepublishOnly": "pnpm run build",
     "verify": "pnpm run verify:ios && pnpm run verify:android && pnpm run verify:web",
     "verify:android": "node scripts/verify-android.js",
-    "verify:ios": "xcodebuild -scheme IndependoCapacitorVoiceRecorder -destination generic/platform=iOS",
+    "verify:ios": "xcodebuild -scheme EaselynowCapacitorAuditRecorder -destination generic/platform=iOS",
     "verify:web": "pnpm run build",
     "watch": "tsc --watch",
     "test": "pnpm run test:web && pnpm run test:android && pnpm run test:ios",
@@ -77,7 +77,7 @@
     "docgen": "docgen --api VoiceRecorderPlugin --output-readme README.md --output-json dist/docs.json",
     "fmt": "pnpm run eslint --fix"
   },
-  "name": "@independo/capacitor-voice-recorder",
+  "name": "@easelynow/capacitor-audit-recorder",
   "dependencies": {
     "capacitor-blob-writer": "^1.1.20"
   },

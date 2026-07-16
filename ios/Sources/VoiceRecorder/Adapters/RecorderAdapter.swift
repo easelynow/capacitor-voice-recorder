@@ -8,6 +8,8 @@ protocol RecorderAdapter: AnyObject {
     var onInterruptionBegan: (() -> Void)? { get set }
     /// Callback invoked when interruptions end.
     var onInterruptionEnded: (() -> Void)? { get set }
+    /// Callback invoked when a segment is ready (segmented recording mode).
+    var onSegmentReady: ((SegmentInfo) -> Void)? { get set }
 
     /// Starts recording audio.
     func startRecording(recordOptions: RecordOptions?) -> Bool
@@ -23,4 +25,7 @@ protocol RecorderAdapter: AnyObject {
     func getCurrentAmplitude() -> Double
     /// Returns the output file for the current session.
     func getOutputFile() -> URL
+    /// Flushes the current in-progress segment without stopping the session.
+    /// terminating: when true, stops recorder without restarting (app is dying).
+    func flushCurrentSegment(terminating: Bool, completion: @escaping (SegmentInfo?) -> Void)
 }
