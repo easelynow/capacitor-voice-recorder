@@ -10,7 +10,7 @@
   "prettier": "@ionic/prettier-config",
   "repository": {
     "type": "git",
-    "url": "https://github.com/easelynow/capacitor-audit-recorder.git"
+    "url": "https://github.com/easelynow/capacitor-voice-recorder.git"
   },
   "description": "Capacitor plugin for continuous background audit voice recording (segmented)",
   "version": "0.1.0",

@@ -1,6 +1,7 @@
 package app.independo.capacitorvoicerecorder;
 
 import android.Manifest;
+import android.content.Intent;
 import app.independo.capacitorvoicerecorder.adapters.PermissionChecker;
 import app.independo.capacitorvoicerecorder.adapters.RecordDataMapper;
 import app.independo.capacitorvoicerecorder.adapters.RecorderPlatform;
@@ -10,9 +11,12 @@ import app.independo.capacitorvoicerecorder.core.RecordData;
 import app.independo.capacitorvoicerecorder.core.RecordOptions;
 import app.independo.capacitorvoicerecorder.core.ResponseFormat;
 import app.independo.capacitorvoicerecorder.core.ResponseGenerator;
+import app.independo.capacitorvoicerecorder.core.SegmentInfo;
 import app.independo.capacitorvoicerecorder.platform.DefaultRecorderPlatform;
+import app.independo.capacitorvoicerecorder.platform.RecordingForegroundService;
 import app.independo.capacitorvoicerecorder.service.VoiceRecorderService;
 import app.independo.capacitorvoicerecorder.service.VoiceRecorderServiceException;
+import com.getcapacitor.JSObject;
 import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -25,14 +29,10 @@ import com.getcapacitor.annotation.PermissionCallback;
     name = "VoiceRecorder",
     permissions = { @Permission(alias = VoiceRecorder.RECORD_AUDIO_ALIAS, strings = { Manifest.permission.RECORD_AUDIO }) }
 )
-/** Capacitor bridge for the VoiceRecorder plugin. */
 public class VoiceRecorder extends Plugin {
 
-    /** Permission alias used by the Capacitor permission API. */
     static final String RECORD_AUDIO_ALIAS = "voice recording";
-    /** Service layer that owns recording flows and validation. */
     private VoiceRecorderService service;
-    /** Response format derived from plugin configuration. */
     private ResponseFormat responseFormat;
 
     @Override
@@ -42,15 +42,14 @@ public class VoiceRecorder extends Plugin {
         RecorderPlatform platform = new DefaultRecorderPlatform(getContext());
         PermissionChecker permissionChecker = this::doesUserGaveAudioRecordingPermission;
         service = new VoiceRecorderService(platform, permissionChecker);
+        RecordingForegroundService.VoiceRecorderServiceHolder.getInstance().setService(service);
     }
 
-    /** Checks whether the device can record audio. */
     @PluginMethod
     public void canDeviceVoiceRecord(PluginCall call) {
         call.resolve(ResponseGenerator.fromBoolean(service.canDeviceVoiceRecord()));
     }
 
-    /** Requests microphone permission or returns success if already granted. */
     @PluginMethod
     public void requestAudioRecordingPermission(PluginCall call) {
         if (service.hasAudioRecordingPermission()) {
@@ -60,52 +59,76 @@ public class VoiceRecorder extends Plugin {
         }
     }
 
-    /** Forwards permission results back to the JS call. */
     @PermissionCallback
     private void recordAudioPermissionCallback(PluginCall call) {
         this.hasAudioRecordingPermission(call);
     }
 
-    /** Returns whether the app has microphone permission. */
     @PluginMethod
     public void hasAudioRecordingPermission(PluginCall call) {
         call.resolve(ResponseGenerator.fromBoolean(service.hasAudioRecordingPermission()));
     }
 
-    /** Starts a recording session. */
     @PluginMethod
     public void startRecording(PluginCall call) {
         try {
             String directory = call.getString("directory");
             String subDirectory = call.getString("subDirectory");
-            RecordOptions options = new RecordOptions(directory, subDirectory);
+            Integer segmentDurationMs = call.getInt("segmentDurationMs", 0);
+            if (segmentDurationMs != null && segmentDurationMs == 0) {
+                segmentDurationMs = null;
+            }
+            String sessionId = call.getString("sessionId");
+
+            RecordOptions options = new RecordOptions(directory, subDirectory, segmentDurationMs, sessionId);
+
+            boolean isSegmented = segmentDurationMs != null && segmentDurationMs > 0
+                && directory != null && sessionId != null && !sessionId.isEmpty();
+
             service.startRecording(
                 options,
                 () -> notifyListeners("voiceRecordingInterrupted", null),
-                () -> notifyListeners("voiceRecordingInterruptionEnded", null)
+                () -> notifyListeners("voiceRecordingInterruptionEnded", null),
+                segmentInfo -> {
+                    JSObject data = new JSObject();
+                    data.put("sessionId", segmentInfo.sessionId());
+                    data.put("index", segmentInfo.index());
+                    data.put("uri", segmentInfo.uri());
+                    data.put("fileName", segmentInfo.fileName());
+                    data.put("msDuration", segmentInfo.msDuration());
+                    data.put("mimeType", segmentInfo.mimeType());
+                    notifyListeners("segmentReady", data);
+                }
             );
+
+            if (isSegmented) {
+                startForegroundService();
+            }
+
             call.resolve(ResponseGenerator.successResponse());
         } catch (VoiceRecorderServiceException exp) {
             call.reject(toLegacyMessage(exp.getCode()), exp.getCode(), exp);
         }
     }
 
-    /** Stops recording and returns the recording payload. */
     @PluginMethod
     public void stopRecording(PluginCall call) {
         try {
             RecordData recordData = service.stopRecording();
+
+            stopForegroundService();
+
             if (responseFormat == ResponseFormat.NORMALIZED) {
                 call.resolve(ResponseGenerator.dataResponse(RecordDataMapper.toNormalizedJSObject(recordData)));
             } else {
                 call.resolve(ResponseGenerator.dataResponse(RecordDataMapper.toLegacyJSObject(recordData)));
             }
         } catch (VoiceRecorderServiceException exp) {
+            stopForegroundService();
             call.reject(toLegacyMessage(exp.getCode()), exp.getCode(), exp);
         }
     }
 
-    /** Pauses an active recording session if supported. */
     @PluginMethod
     public void pauseRecording(PluginCall call) {
         try {
@@ -115,7 +138,6 @@ public class VoiceRecorder extends Plugin {
         }
     }
 
-    /** Resumes a paused recording session if supported. */
     @PluginMethod
     public void resumeRecording(PluginCall call) {
         try {
@@ -125,28 +147,34 @@ public class VoiceRecorder extends Plugin {
         }
     }
 
-    /** Returns the current recording status. */
     @PluginMethod
     public void getCurrentStatus(PluginCall call) {
         call.resolve(ResponseGenerator.statusResponse(service.getCurrentStatus()));
     }
 
-    /** Returns the current input amplitude. */
     @PluginMethod
     public void getCurrentAmplitude(PluginCall call) {
         call.resolve(ResponseGenerator.dataResponse(service.getCurrentAmplitude()));
     }
 
-    /** Checks whether the app has the RECORD_AUDIO permission. */
     private boolean doesUserGaveAudioRecordingPermission() {
         return getPermissionState(VoiceRecorder.RECORD_AUDIO_ALIAS).equals(PermissionState.GRANTED);
     }
 
-    /** Maps canonical error codes back to legacy error messages. */
     private String toLegacyMessage(String canonicalCode) {
         if (ErrorCodes.DEVICE_CANNOT_VOICE_RECORD.equals(canonicalCode)) {
             return Messages.CANNOT_RECORD_ON_THIS_PHONE;
         }
         return canonicalCode;
+    }
+
+    private void startForegroundService() {
+        Intent intent = new Intent(getContext(), RecordingForegroundService.class);
+        getContext().startForegroundService(intent);
+    }
+
+    private void stopForegroundService() {
+        Intent intent = new Intent(getContext(), RecordingForegroundService.class);
+        getContext().stopService(intent);
     }
 }
