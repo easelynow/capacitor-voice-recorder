@@ -48,7 +48,7 @@ Add the following to your `Info.plist`:
 
 - Capacitor 8+
 - iOS 15+
-- Android minSdk 24+; builds require Java 21 (recommended). `pnpm verify:android` requires a Java version supported
+- Android minSdk 26+; builds require Java 21 (recommended). `pnpm verify:android` requires a Java version supported
   by the bundled Gradle wrapper (currently Java 21–24, with Java 21 recommended).
 
 ### Compatibility
@@ -366,13 +366,13 @@ Interface representing a generic response with a boolean value.
 
 Can be used to specify options for the recording.
 
-| Prop                         | Type                                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ---------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`directory`**              | <code><a href="#directory">Directory</a></code> | The capacitor filesystem directory where the recording should be saved. If not specified, the recording will be stored in a base64 string and returned in the <a href="#recordingdata">`RecordingData`</a> object.                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **`subDirectory`**           | <code>string</code>                             | An optional subdirectory in the specified directory where the recording should be saved.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| **`requirePlaybackSupport`** | <code>boolean</code>                            | Whether the web implementation should require the selected recording MIME type to also be playable by the browser's native HTML `&lt;audio&gt;` element. Defaults to `true` on web to reduce cases where `MediaRecorder` reports support for a format but the recorded file cannot be played back in the same browser (observed on some Safari/iOS/WKWebView combinations). Native platforms ignore this option.                                                                                                                                                                                                                         |
-| **`segmentDurationMs`**      | <code>number</code>                             | When set to a positive number of milliseconds, native platforms record in CONTINUOUS SEGMENTED mode: the recorder auto-finalizes a segment file every `segmentDurationMs` and immediately starts the next one, emitting a `segmentReady` event per finalized segment. Requires `directory` to be set so segments are written to disk. Designed for long (30-90 min) background audit recordings without holding a large in-memory blob. If omitted or `0`, the recorder behaves as a single-file recording (legacy). Web honors this via `MediaRecorder` timeslice; interruption-based segmentation on iOS is independent of this value. |
-| **`sessionId`**              | <code>string</code>                             | Correlation id stamped onto every `segmentReady` event for this recording session (e.g. the audit session UUID). Native echoes it back unmodified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Prop                         | Type                                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`directory`**              | <code><a href="#directory">Directory</a></code> | The capacitor filesystem directory where the recording should be saved. If not specified, the recording will be stored in a base64 string and returned in the <a href="#recordingdata">`RecordingData`</a> object.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **`subDirectory`**           | <code>string</code>                             | An optional subdirectory in the specified directory where the recording should be saved.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **`requirePlaybackSupport`** | <code>boolean</code>                            | Whether the web implementation should require the selected recording MIME type to also be playable by the browser's native HTML `&lt;audio&gt;` element. Defaults to `true` on web to reduce cases where `MediaRecorder` reports support for a format but the recorded file cannot be played back in the same browser (observed on some Safari/iOS/WKWebView combinations). Native platforms ignore this option.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **`segmentDurationMs`**      | <code>number</code>                             | When set to a positive number of milliseconds, native platforms record in CONTINUOUS SEGMENTED mode: the recorder auto-finalizes a segment file every `segmentDurationMs` and immediately starts the next one, emitting a `segmentReady` event per finalized segment. Requires `directory` to be set so segments are written to disk. Designed for long (30-90 min) background audit recordings without holding a large in-memory blob. If omitted or `0`, the recorder behaves as a single-file recording (legacy). Web honors this via `MediaRecorder` timeslice; interruption-based segmentation on iOS is independent of this value. Requires Android API 26+ (`MediaRecorder.setNextOutputFile`); on Android, segmented sessions automatically run a microphone foreground service for the session duration. |
+| **`sessionId`**              | <code>string</code>                             | Correlation id stamped onto every `segmentReady` event for this recording session (e.g. the audit session UUID). Native echoes it back unmodified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 
 #### RecordingData
@@ -421,7 +421,7 @@ segmented recording finalizes a `segmentDurationMs`-long chunk to disk.
 | **`uri`**        | <code>string</code> | Capacitor filesystem URI of the finalized segment file.                                               |
 | **`fileName`**   | <code>string</code> | File name of the segment (e.g. `audio_{sessionId}_{index}.m4a`).                                      |
 | **`msDuration`** | <code>number</code> | Audio content duration of this segment in milliseconds.                                               |
-| **`mimeType`**   | <code>string</code> | MIME type of the segment file (iOS: `audio/mp4`).                                                     |
+| **`mimeType`**   | <code>string</code> | MIME type of the segment file (iOS/Android: `audio/mp4`).                                             |
 
 
 ### Type Aliases
@@ -486,6 +486,33 @@ event fires. When the interruption ends, the `voiceRecordingInterruptionEnded` e
 If interruptions occur on iOS, recordings are segmented and merged when you stop. iOS recordings are normalized to an
 M4A container with MIME type `audio/mp4` for consistent output across interrupted and non-interrupted sessions.
 
+### Android segmented recording (continuous audit recordings)
+
+When `RecordingOptions.segmentDurationMs` is set together with `directory` and `sessionId`, Android records in the
+same continuous-segmented mode as iOS: segments rotate gaplessly (`MediaRecorder.setNextOutputFile`) into MPEG-4/`.m4a`
+files named `audio_{sessionId}_{index}.m4a`, and each finalized segment fires `segmentReady` with MIME type `audio/mp4`.
+This requires **Android API 26+** (`MediaRecorder.setNextOutputFile` is unavailable below API 26).
+
+**Foreground service.** Segmented recording automatically starts a microphone foreground service
+(`foregroundServiceType="microphone"`) for the duration of the session and stops it when `stopRecording()` resolves.
+This is required on Android 12+, which otherwise revokes microphone access within seconds of the app leaving the
+foreground. The plugin declares `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_MICROPHONE` in its own manifest — no
+host-app manifest changes are needed. `startRecording()` with `segmentDurationMs` set must be called while the app is
+in the foreground (Android restricts background-started foreground services on API 31+).
+
+**Notification.** The foreground service posts a low-importance, silent notification ("Recording in progress") while
+active. On Android 13+ (API 33), posting a visible notification requires the runtime `POST_NOTIFICATIONS` permission;
+if the host app has not requested/been granted it, the foreground service still runs (recording is unaffected), it
+just may not show a visible notification on some OEMs. Request `POST_NOTIFICATIONS` from the host app if you want a
+guaranteed visible indicator.
+
+**Termination behavior.** If the app process is swipe-killed while a segmented session is active, the plugin makes a
+best-effort attempt (`Service.onTaskRemoved`) to finalize the in-progress segment and write a
+`pending_flush_{sessionId}.json` marker file next to the segment files (same shape as iOS's terminate-flush marker),
+so a boot-time disk scan can recover it. If the process is killed outright (e.g. low-memory `SIGKILL`) with no
+callback opportunity, the in-progress segment's MPEG-4 container is not finalized (no `moov` atom) and is not
+recoverable — only the last partial segment is at risk; all previously sealed segments are unaffected.
+
 ### Web constraints
 
 - `getUserMedia` requires a secure context (HTTPS or localhost).
@@ -520,7 +547,7 @@ await VoiceRecorder.startRecording({
 The plugin returns the recording in one of several possible formats. The actual MIME type depends on the platform and
 browser capabilities.
 
-- Android: `audio/aac`
+- Android: `audio/aac` (legacy single-file recording); `audio/mp4` (M4A container) when using continuous segmented recording (`RecordingOptions.segmentDurationMs`)
 - iOS: `audio/mp4` (M4A container)
 - Web: first supported MIME type from the plugin's ordered list, with a default preference for formats that are
   reported as playable by the browser `<audio>` element (in addition to `MediaRecorder` support)

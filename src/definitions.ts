@@ -46,6 +46,8 @@ export interface RecordingOptions {
      * If omitted or `0`, the recorder behaves as a single-file recording (legacy).
      * Web honors this via `MediaRecorder` timeslice; interruption-based segmentation
      * on iOS is independent of this value.
+     * Requires Android API 26+ (`MediaRecorder.setNextOutputFile`); on Android, segmented
+     * sessions automatically run a microphone foreground service for the session duration.
      */
     segmentDurationMs?: number;
 
@@ -143,7 +145,7 @@ export interface SegmentReadyEvent {
     fileName: string;
     /** Audio content duration of this segment in milliseconds. */
     msDuration: number;
-    /** MIME type of the segment file (iOS: `audio/mp4`). */
+    /** MIME type of the segment file (iOS/Android: `audio/mp4`). */
     mimeType: string;
 }
 
