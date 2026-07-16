@@ -610,15 +610,14 @@ platform.
 
 ## Origins and credit
 
-This project started as a fork of [
-`tchvu3/capacitor-voice-recorder`](https://github.com/tchvu3/capacitor-voice-recorder). Thanks to Avihu Harush for
-the original implementation and community groundwork. [Independo GmbH](https://www.independo.app/) subsequently
-re-architected the plugin for improved performance, reliability, and testability (service/adapters split, contract
-tests, and a normalized response path) and maintained it as `@independo/capacitor-voice-recorder`.
+This codebase originated as a fork of [
+`tchvu3/capacitor-voice-recorder`](https://github.com/tchvu3/capacitor-voice-recorder) (thanks to Avihu Harush for
+the original implementation), which [Independo GmbH](https://www.independo.app/) later re-architected for improved
+performance, reliability, and testability (service/adapters split, contract tests, a normalized response path) and
+published as `@independo/capacitor-voice-recorder`.
 
-This repository is now maintained independently as `@easelynow/capacitor-audit-recorder`, extending that
-re-architected base with continuous segmented background recording for long-form audit sessions — gapless segment
-rotation, interruption/foreground-service handling, and crash-recovery semantics on both iOS and Android (see
-[Overview](#overview) and [Platform behaviors](#platform-behaviors)). The codebase diverges substantially from both
-upstream projects at this point, which is why it publishes under its own package name rather than tracking either
-fork.
+**This repository is now an independently owned codebase**, maintained as `@easelynow/capacitor-audit-recorder`. It
+is not tracked as a fork, does not pull upstream changes, and has no dependency on either predecessor project going
+forward — all future development (Android/iOS parity, the continuous segmented audit-recording mode described in
+[Overview](#overview) and [Platform behaviors](#platform-behaviors), and everything after) happens here
+independently. The history above is credited for provenance only.
