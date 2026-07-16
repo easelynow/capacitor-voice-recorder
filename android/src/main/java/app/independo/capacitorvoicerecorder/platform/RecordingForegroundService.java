@@ -9,14 +9,12 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.IBinder;
 
 import androidx.core.app.NotificationCompat;
 
 import app.independo.capacitorvoicerecorder.R;
-import app.independo.capacitorvoicerecorder.VoiceRecorder;
+import app.independo.capacitorvoicerecorder.service.VoiceRecorderService;
 
 import org.json.JSONObject;
 
@@ -28,12 +26,9 @@ public class RecordingForegroundService extends Service {
     private static final String CHANNEL_ID = "voice_recorder_recording";
     private static final int NOTIFICATION_ID = 1001;
 
-    private Handler mainHandler;
-
     @Override
     public void onCreate() {
         super.onCreate();
-        mainHandler = new Handler(Looper.getMainLooper());
         createNotificationChannel();
     }
 
@@ -83,32 +78,33 @@ public class RecordingForegroundService extends Service {
     }
 
     private Notification buildNotification() {
-        Intent notificationIntent = new Intent(this, VoiceRecorder.class);
-        PendingIntent pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            notificationIntent,
-            PendingIntent.FLAG_IMMUTABLE
-        );
+        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        PendingIntent pendingIntent = launchIntent != null
+            ? PendingIntent.getActivity(this, 0, launchIntent, PendingIntent.FLAG_IMMUTABLE)
+            : null;
 
-        return new NotificationCompat.Builder(this, CHANNEL_ID)
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Recording in progress")
             .setContentText("Audio is being recorded")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .build();
+            .setCategory(NotificationCompat.CATEGORY_SERVICE);
+        if (pendingIntent != null) {
+            builder.setContentIntent(pendingIntent);
+        }
+        return builder.build();
     }
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
 
-        mainHandler.post(() -> {
-            flushCurrentSegmentAndWriteMarker();
-        });
+        // Best-effort flush off the main thread: flushCurrentSegment() dispatches onto the
+        // recorder's rotation thread and blocks (up to 5s) for the result. Doing that wait on
+        // the main thread here would risk an ANR during task removal; a plain background thread
+        // keeps this off the main thread without needing a full executor for a one-shot call.
+        new Thread(this::flushCurrentSegmentAndWriteMarker, "RecordingForegroundService-flush").start();
     }
 
     private void flushCurrentSegmentAndWriteMarker() {
@@ -133,7 +129,7 @@ public class RecordingForegroundService extends Service {
     private void writePendingFlushMarker(String sessionId, int segmentIndex, String fileName,
                                           String path, int durationMs, String mimeType) {
         try {
-            File segmentFile = new File(path.replace("file://", ""));
+            File segmentFile = new File(path.startsWith("file://") ? path.substring("file://".length()) : path);
             File parentDir = segmentFile.getParentFile();
 
             if (parentDir != null) {
